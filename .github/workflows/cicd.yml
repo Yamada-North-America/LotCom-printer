@@ -1,140 +1,150 @@
-name: .NET CI/CD
+name: Build release
+run-name: Stable release ${{ inputs.version || github.ref_name }}
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version without v (for example, 1.0.5); always builds stable'
+        required: true
+        type: string
   push:
-    branches: stable
+    tags:
+      - 'v*'
+      # Continue to support the repository's historical, unprefixed release tags.
+      - '[0-9]*.[0-9]*.[0-9]*'
 
 permissions:
-  contents: write
-  packages: write
-  actions: write
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-stable-release
+  cancel-in-progress: false
 
 env:
-  DOTNET_VERSION: '9.0.103' # The .NET SDK version to use
-  NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages # action runner's installed NuGet packages
+  NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
 
 jobs:
-
   build:
-
-    name: build-windows
     runs-on: windows-2022
-
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: source/LotCom-printer
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+      libraries: ${{ steps.provenance.outputs.libraries }}
     steps:
-    - uses: actions/checkout@v3
-    - name: Get version number from commit
-      env:
-        GH_TOKEN: ${{ github.token }}
-      id: version-number
-      shell: pwsh
-      run: |
-        # retrieve the most recent commit via SHA
-        $sha = "${{ github.sha }}"
-        $commitMessage = gh api /repos/Yamada-North-America/lotcom-printer/commits/$sha --jq ".commit.message"
+      - name: Check out stable or the tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'stable' || github.sha }}
+          path: source/LotCom-printer
+          fetch-depth: 0
+          persist-credentials: false
 
-        # parse the version number out of the commit message
-        $pattern = '\d+\.\d+\.\d+\.?[\d]*'
-        $result = $commitMessage | Select-String -Pattern $pattern
-        $result = $result.Matches.Value
-        Write-Host "New release version number: $result" 
+      - name: Validate version and stable ancestry
+        id: release
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: ./.github/scripts/resolve-release.ps1
 
-        # set the output of this step to the VERSION_NUMBER environment var
-        echo "VERSION_NUMBER=$result" >> $env:GITHUB_ENV
+      - name: Reject an existing release under either tag convention
+        uses: actions/github-script@v7
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        with:
+          script: |
+            for (const tag of [process.env.RELEASE_VERSION, `v${process.env.RELEASE_VERSION}`]) {
+              try {
+                await github.rest.repos.getReleaseByTag({ ...context.repo, tag });
+                core.setFailed(`Release ${tag} already exists. Use a new version, or delete the incomplete draft before retrying.`);
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
 
-    - name: Setup .NET Core
-      uses: actions/setup-dotnet@v4.3.0
-      with:
-        dotnet-version: ${{ env.DOTNET_VERSION }}
-        cache: true
-        cache-dependency-path: "./LotComPrinter/packages.lock.json"
+      - name: Check out the required sibling LotCom libraries
+        uses: actions/checkout@v4
+        with:
+          repository: Yamada-North-America/LotCom-libraries
+          ref: ef2da369b7bda48abc0d3b073625754dcae10bd8
+          path: source/LotCom-libraries
+          persist-credentials: false
 
-    - name: Download LotCom Libraries
-      env:
-        PAT_1: ${{ secrets.PAT_1 }}
-      shell: pwsh
-      run: |
-        # download LotCom Libraries latest
-        cd "D:\a\LotCom-printer"
-        git clone https://sourve:${env:PAT_1}@github.com/Yamada-North-America/LotCom-libraries.git
+      - name: Record dependency revision
+        id: provenance
+        run: |
+          $sha = git -C ../LotCom-libraries rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the library revision.' }
+          "libraries=$sha" >> $env:GITHUB_OUTPUT
 
-    - name: Install dependencies
-      shell: pwsh
-      run: dotnet restore
-    
-    - name: Install required workloads
-      shell: pwsh
-      run: |
-        # install dotnet tools
-        dotnet tool install --global wix
-        dotnet workload restore
-        dotnet workload install android
-        dotnet workload install maui
-      
-    - name: Build
-      shell: pwsh
-      run: |
-        dotnet build -f net9.0-windows10.0.19041.0 -c Release -p:RuntimeIdentifierOverride=win10-x64 -p:WindowsPackageType=None -p:WindowsAppSDKSelfContained=true --sc
-        
-    - name: Download setup
-      env:
-        PAT_1: ${{ secrets.PAT_1 }}
-      shell: pwsh
-      run: |
-        # download LotCom-printer-setup latest
-        cd "D:\a\LotCoM-printer\LotCoM-printer\LotCoMPrinter"
-        git clone https://sourve:${env:PAT_1}@github.com/Yamada-North-America/LotCom-printer-setup.git
+      - name: Install the application SDK and WiX runtime
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+          cache: true
+          cache-dependency-path: source/LotCom-printer/LotCoMPrinter/packages.lock.json
 
-    - name: Build setup
-      shell: pwsh
-      run: |
-        # build the Wix setup program
-        cd "D:\a\LotCoM-printer\LotCoM-printer\LotCoMPrinter\LotCom-printer-setup"
-        dotnet build
+      - name: Install the MAUI Windows workload
+        run: |
+          dotnet workload install maui-windows
+          if ($LASTEXITCODE -ne 0) { throw 'MAUI Windows workload installation failed.' }
 
-    - name: Run setup
-      shell: pwsh
-      run: |
-        # run the LotComPrinterSetup.exe script (Wix)
-        cd "D:\a\LotCoM-printer\LotCoM-printer\LotCoMPrinter\LotCom-printer-setup\LotComPrinterSetup\bin\Debug\net472"
-        .\LotComPrinterSetup.exe "$env:VERSION_NUMBER"
+      - name: Install pinned WiX and required extensions
+        run: |
+          dotnet tool install --global wix --version 4.0.6 --allow-roll-forward
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed.' }
+          foreach ($extension in @('WixToolset.UI.wixext', 'WixToolset.Util.wixext')) {
+            wix extension add --global "$extension/4.0.6"
+            if ($LASTEXITCODE -ne 0) { throw "WiX extension installation failed: $extension" }
+          }
 
-        # save the MSI to a Package directory
-        cd "D:\a\LotCom-printer\LotCom-printer\LotComPrinter\bin\Release\net9.0-windows10.0.19041.0\win10-x64\Installer"
-        New-Item -ItemType directory -Path "D:\a\Package" -ErrorAction SilentlyContinue
-        Copy-Item -Path ".\LotComPrinter_$env:VERSION_NUMBER.msi" -Destination "D:\a\Package"
+      - name: Publish the application and build release packages
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: ./.github/scripts/build-release.ps1 -Version $env:RELEASE_VERSION
 
-    - name: Archive MSI package artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-latest
-        path: |
-          D:\a\Package
+      - name: Upload release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: LotComPrinter-${{ steps.release.outputs.version }}-win-x64
+          path: source/LotCom-printer/artifacts/packages/*
+          if-no-files-found: error
+          retention-days: 30
 
-    - name: Download MSI package
-      uses: actions/download-artifact@v4
-      with:
-        name: windows-latest
-        path: |
-          D:\a\Package
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release script from the exact built stable commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          path: source
+          persist-credentials: false
 
-    - name: Create release
-      env:
-        GITHUB_TOKEN: ${{ secrets.PAT_1 }}
-      shell: pwsh
-      run: |
-        # use default tag for generated releases
-        $tag = "$env:VERSION_NUMBER"
-        
-        # create github release and set default notes
-        gh release create "$tag" --repo="$GITHUB_REPOSITORY" --title="$tag" --notes "Generated release"
-    
-    - name: Upload MSI to release
-      env:
-        GITHUB_TOKEN: ${{ secrets.PAT_1 }}
-      shell: pwsh
-      run: |
-        # use default tag for generated releases
-        $tag = "$env:VERSION_NUMBER"
+      - uses: actions/download-artifact@v4
+        with:
+          name: LotComPrinter-${{ needs.build.outputs.version }}-win-x64
+          path: packages
 
-        # upload the MSIX to the release
-        gh release upload $tag "D:\a\Package\LotComPrinter_$env:VERSION_NUMBER.msi"
+      - name: Create draft release with MSI, ZIP, and checksums
+        uses: actions/github-script@v7
+        env:
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
+          LIBRARIES_COMMIT: ${{ needs.build.outputs.libraries }}
+        with:
+          script: |
+            const publish = require('./source/.github/scripts/publish-release.cjs');
+            await publish({ github, context, core });
